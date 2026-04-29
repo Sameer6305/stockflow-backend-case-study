@@ -13,12 +13,12 @@ The Flask application is built through an application factory. That makes config
 
 ## Data Model
 
-The initial schema centers on two core entities:
+The starter code models a simple warehouse-linked inventory item so the application stays small and readable for interview review.
 
 - `Warehouse` stores location-level inventory context.
-- `InventoryItem` stores trackable stock records and a foreign key to the owning warehouse.
+- `InventoryItem` stores a trackable stock record and a foreign key to the owning warehouse.
 
-This separation gives the system room to support replenishment logic, warehouse transfers, reservation workflows, and item status calculation.
+The case-study documents expand this into a production-oriented warehouse-product balance model with suppliers, inventory transactions, and sales activity. That keeps the repository believable as a starter service while still showing the direction the design should take in production.
 
 ## Service Layer
 

@@ -4,7 +4,7 @@ StockFlow is a B2B SaaS inventory management platform for companies that operate
 
 ## Project Overview
 
-The backend uses Flask, SQLAlchemy, and SQLite for local demo execution. The application is structured around an application factory, blueprints, service-layer business logic, and an explicit database session boundary so the code can scale from a case-study demo to a production deployment with PostgreSQL.
+The backend uses Flask, SQLAlchemy, and SQLite for local demo execution. The application is structured around an application factory, blueprints, service-layer business logic, and an explicit database session boundary so the code can scale from a case-study demo to a production deployment with PostgreSQL. The runtime app is intentionally compact, while the case-study documents describe the richer warehouse-product model used in the production-oriented design work.
 
 ## Architecture Overview
 
