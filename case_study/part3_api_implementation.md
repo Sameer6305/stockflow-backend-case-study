@@ -14,7 +14,7 @@ It returns products that are below or approaching their configured stock thresho
 
 - `company_id` is a numeric primary key.
 - Each product belongs to one company and can appear in multiple warehouses through an inventory balance table.
-- Thresholds may be configured per product and optionally overridden per warehouse if the business later needs location-specific rules.
+- Thresholds are primarily stored on the inventory balance row, with a company default available for rows that do not yet have a specific threshold.
 - "Recent sales activity" means at least one sale within the last 30 days unless the product configuration says otherwise.
 - Sales data is considered authoritative only after it is persisted in the sales activity table.
 - Supplier data is optional; products without suppliers should still appear in the response with a null supplier block so procurement gaps are visible.
@@ -39,9 +39,8 @@ Why this matters: alerts should reflect current demand. Without this filter, the
 
 The alert threshold should be determined in the following order:
 
-1. Warehouse-specific threshold when configured.
-2. Product-level threshold when no warehouse override exists.
-3. Company default threshold when product metadata is incomplete.
+1. Inventory-balance threshold when configured.
+2. Company default threshold when the row does not yet have a specific value.
 
 An alert is triggered when `quantity_on_hand <= threshold`.
 
@@ -64,51 +63,51 @@ The response uses the same stable envelope as the rest of the case study:
 {
   "success": true,
   "data": {
-	"company_id": 42,
-	"lookback_days": 30,
-	"alerts": [
-	  {
-		"product_id": 101,
-		"sku": "SKU-1001",
-		"product_name": "Wireless Scanner",
-		"archived": false,
-		"warehouse": {
-		  "warehouse_id": 9,
-		  "warehouse_code": "WH-BLR-01",
-		  "warehouse_name": "Bangalore Main"
-		},
-		"inventory": {
-		  "quantity_on_hand": 12,
-		  "threshold": 20,
-		  "reserved_quantity": 3,
-		  "is_negative": false
-		},
-		"sales_activity": {
-		  "recent_units_sold": 40,
-		  "last_sale_at": "2026-04-24T10:15:00Z",
-		  "daily_sales_velocity": 1.33
-		},
-		"days_until_stockout": 9.0,
-		"supplier": {
-		  "supplier_id": 7,
-		  "supplier_name": "Northwind Supplies",
-		  "supplier_code": "NWS-01",
-		  "lead_time_days": 5,
-		  "min_order_quantity": 10
-		},
-		"alert_reason": "low_stock_with_recent_sales"
-	  }
-	],
-	"pagination": {
-	  "page": 1,
-	  "per_page": 25,
-	  "total_items": 1,
-	  "total_pages": 1
-	}
+        "company_id": 42,
+        "lookback_days": 30,
+        "alerts": [
+            {
+                "product_id": 101,
+                "sku": "SKU-1001",
+                "product_name": "Wireless Scanner",
+                "is_active": true,
+                "warehouse": {
+                    "warehouse_id": 9,
+                    "warehouse_code": "WH-BLR-01",
+                    "warehouse_name": "Bangalore Main"
+                },
+                "inventory": {
+                    "quantity_on_hand": 12,
+                    "threshold": 20,
+                    "reserved_quantity": 3,
+                    "is_negative": false
+                },
+                "sales_activity": {
+                    "recent_units_sold": 40,
+                    "last_sale_at": "2026-04-24T10:15:00Z",
+                    "daily_sales_velocity": 1.33
+                },
+                "days_until_stockout": 9.0,
+                "supplier": {
+                    "supplier_id": 7,
+                    "supplier_name": "Northwind Supplies",
+                    "supplier_code": "NWS-01",
+                    "lead_time_days": 5,
+                    "min_order_quantity": 10
+                },
+                "alert_reason": "low_stock_with_recent_sales"
+            }
+        ],
+        "pagination": {
+            "page": 1,
+            "per_page": 25,
+            "total_items": 1,
+            "total_pages": 1
+        }
   },
   "meta": {
-	"generated_at": "2026-04-29T12:00:00Z",
-	"lookback_window_days": 30
+        "generated_at": "2026-04-29T12:00:00Z",
+        "lookback_window_days": 30
   }
 }
 ```
@@ -122,7 +121,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import ceil
 
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, jsonify, request
 from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -266,8 +265,8 @@ def get_low_stock_alerts(company_id: str):
         alerts = []
         for row in rows:
             quantity_on_hand = int(row.quantity_on_hand or 0)
-            threshold = row.threshold if row.threshold is not None else current_app.config.get("DEFAULT_LOW_STOCK_THRESHOLD", 0)
-            threshold = int(threshold)
+            company_default_threshold = 0
+            threshold = int(row.threshold if row.threshold is not None else company_default_threshold)
             recent_units_sold = int(row.recent_units_sold or 0)
 
             # No recent sales means the product is not included in the alert feed.
@@ -288,7 +287,7 @@ def get_low_stock_alerts(company_id: str):
                     "product_id": row.product_id,
                     "sku": row.sku,
                     "product_name": row.product_name,
-                    "archived": False,
+                    "is_active": True,
                     "warehouse": {
                         "warehouse_id": row.warehouse_id,
                         "warehouse_code": row.warehouse_code,
@@ -464,12 +463,11 @@ Accept: application/json
 
 ## Future Improvements
 
-- Async alerting to push notifications only when relevant conditions change.
-- Predictive forecasting based on sales trend windows and supplier lead times.
-- ML-based stockout prediction for products with irregular demand patterns.
-- Kafka/event-driven inventory updates so alert generation becomes reactive.
-- Redis caching for short-lived alert summaries with strict invalidation rules.
-- Alert deduplication so the same product does not spam operators across repeated runs.
+- Persist alert snapshots so repeated runs can reuse the same computed view during a request window.
+- Add alert suppression rules so the same SKU does not repeatedly notify operators within a short period.
+- Improve reorder recommendations with supplier lead time and recent sales trend calculations.
+- Move heavy alert generation to a scheduled job when tenant volume grows.
+- Add a dedicated notification layer for email or in-app delivery after the alert feed is stable.
 
 ## Closing Assessment
 
