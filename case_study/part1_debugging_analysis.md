@@ -81,7 +81,7 @@ Example failure scenario: A product is created with `warehouse_id=9999` even tho
 Recommended fix: Resolve the warehouse inside the transaction and reject the write if the warehouse does not exist or is inactive.
 
 ### 8. Optional Field Handling Is Not Safe
-
+This endpoint is intended to create or update inventory state for a B2B SaaS inventory platform. In production, that means the handler must protect stock integrity, enforce warehouse-level correctness, and fail safely when data is invalid or the database rejects a write.
 Why it is a problem: Optional fields are treated inconsistently, which can accidentally overwrite valid existing values with `None` or empty strings.
 
 Real production impact: Operators can lose descriptions, reorder thresholds, or warehouse references during partial updates.
@@ -92,18 +92,23 @@ Recommended fix: Distinguish between missing fields and explicit `null` values, 
 
 ### 9. No Authentication Or Authorization Consideration
 
+Example failure scenario: Inventory balance update succeeds, stock history insertion fails, and the API returns an error while the balance row remains committed.
 Why it is a problem: Inventory writes are privileged business operations and should not be open to every client.
 
 Real production impact: Unauthorized users can alter stock, causing fulfillment errors, fraud exposure, and loss of trust with merchants.
+Example failure scenario: The endpoint updates the warehouse inventory balance, then fails when writing the transaction ledger, leaving stock changed but the audit trail missing.
 
 Example failure scenario: A low-privilege user changes product price or quantity and no access control stops the request.
 
+Example failure scenario: A patch request omits `threshold`, but the handler sets the column to `NULL` instead of leaving the prior value unchanged.
 Recommended fix: Require authenticated requests, enforce role-based permissions, and audit all write operations.
 
 ### 10. Products Existing In Multiple Warehouses Is Not Modeled Correctly
+Example failure scenario: An inventory record is created with `warehouse_id=9999` even though that warehouse was archived months ago.
 
 Why it is a problem: A single product may exist in multiple warehouses, but a naive single-row model often collapses all stock into one record.
 
+Example failure scenario: One warehouse is out of stock while another has availability, but the system exposes a single combined quantity and ships from the wrong location.
 Real production impact: Location-specific stock levels become impossible to trust, which breaks transfer logic and warehouse allocation.
 
 Example failure scenario: One warehouse is out of stock while another has availability, but the system exposes a single combined quantity and ships from the wrong location.
@@ -115,12 +120,12 @@ Recommended fix: Model product identity separately from warehouse inventory, and
 Why it is a problem: Two requests can read the same stock value, compute the same new value, and overwrite each other.
 
 Real production impact: Lost updates create undercounted or overcounted inventory, which is a direct revenue and fulfillment risk.
-
+from models import InventoryBalance, Product, Warehouse
 Example failure scenario: Two restock jobs each add 10 units based on the same starting quantity, but the final value reflects only one update.
 
 Recommended fix: Use transaction boundaries, row-level locking where supported, optimistic concurrency control, and database constraints that prevent invalid concurrent states.
 
-### 12. API Response Quality Is Weak
+def create_inventory_balance():
 
 Why it is a problem: The endpoint should return stable, machine-readable responses with clear status codes and error details.
 
@@ -153,38 +158,45 @@ Recommended fix: Keep the HTTP layer thin, move business logic into services, is
 ## Corrected Production-Quality Implementation
 
 The implementation below shows the shape I would expect in production: explicit validation, warehouse lookup, duplicate protection, `Decimal` for money, and a single transactional boundary per request.
-
-```python
-from __future__ import annotations
-
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-
-from flask import Blueprint, jsonify, request
+			existing_balance = (
+				db.session.query(InventoryBalance)
+				.filter(InventoryBalance.product.has(sku=sku), InventoryBalance.warehouse_id == warehouse_id)
+				.one_or_none()
+			)
+			if existing_balance is not None:
+				return _error("inventory balance for this sku already exists in the warehouse", 409, "duplicate_sku")
 from sqlalchemy.exc import IntegrityError
 
 from app import db
 from models import Product, Warehouse
-
-products_bp = Blueprint("products", __name__)
-
-
+				price=price,
+				description=payload.get("description"),
 def _error(message: str, status_code: int, code: str):
 	# Keep error responses uniform so clients and support tools can rely on them.
 	return jsonify({"success": False, "error": {"code": code, "message": message}}), status_code
 
 
 def _success(data, status_code: int = 200):
+			balance = InventoryBalance(
+				company_id=warehouse.company_id,
+				warehouse_id=warehouse_id,
+				product=product,
+				quantity_on_hand=quantity,
+				reserved_quantity=0,
+				low_stock_threshold=payload.get("low_stock_threshold", 0),
+			)
 	# A stable envelope makes client integrations easier to test and safer to evolve.
-	return jsonify({"success": True, "data": data}), status_code
+			db.session.add(product)
+			db.session.add(balance)
 
 
-def _parse_price(raw_value) -> Decimal:
-	# Money must use Decimal. Float math is not acceptable for billing or inventory valuation.
-	try:
-		value = Decimal(str(raw_value))
-	except (InvalidOperation, TypeError, ValueError) as exc:
-		raise ValueError("price must be a valid decimal number") from exc
-
+			{
+				"product_id": product.id,
+				"sku": product.sku,
+				"name": product.name,
+				"warehouse_id": balance.warehouse_id,
+				"quantity_on_hand": balance.quantity_on_hand,
+				"price": str(product.price),
 	if value < Decimal("0"):
 		raise ValueError("price must be greater than or equal to 0")
 
