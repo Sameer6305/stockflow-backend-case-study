@@ -2,316 +2,242 @@
 
 ## Overview
 
-This endpoint is intended to create or update an inventory product record for a B2B SaaS inventory platform. In production, that means the handler must protect stock integrity, enforce warehouse-level correctness, and fail safely when data is invalid or the database rejects a write.
+The original write path was trying to create or update inventory state for a warehouse-linked product record. In a real B2B inventory system, that operation needs to be split carefully: product identity, warehouse identity, and current stock balance are related, but they should not be treated as a single mutable blob.
 
-## Production Review Of The Original Write Path
+The production concern is simple. If the API accepts invalid input or writes partial state, the warehouse can end up with stock that cannot be trusted for picking, replenishment, or reporting.
 
-The original implementation pattern is risky because it treats the request body as trusted input, mutates domain state before validating all business rules, and relies on the database to catch problems after partial work may already have happened. For an inventory system, that is not acceptable: a single bad request can distort stock counts, create duplicate products, or leave a warehouse with records that cannot be reconciled.
+## What The Handler Must Do
+
+The endpoint should:
+
+- validate request shape before touching the database,
+- confirm the warehouse exists and belongs to the correct company,
+- ensure the product exists or is created through a separate product flow,
+- write the inventory balance and inventory transaction in one transaction,
+- return a predictable response when the write is rejected.
+
+That separation keeps the data model consistent with the schema in Part 2 and avoids conflating product master data with warehouse-level stock.
 
 ## Issues Identified
 
-### 1. Lack Of Input Validation
+### 1. Input Validation Is Too Loose
 
-Why it is a problem: The endpoint accepts request data without validating required fields, field types, or value ranges.
+Why it is a problem: the endpoint should never trust request data to already be clean and correctly typed.
 
-Real production impact: Bad payloads can create broken records, trigger runtime errors, or allow nonsense values such as negative stock or empty product names.
+Production impact: invalid values can create negative stock, empty names, malformed prices, or broken foreign key references.
 
-Example failure scenario: A client sends `{"price": "abc", "quantity": -5}` and the endpoint persists invalid business data or crashes during serialization.
+Example failure: a payload with `quantity_on_hand: "ten"` or `price: "abc"` reaches persistence code and fails late, after the request has already moved into business logic.
 
-Recommended fix: Validate payload shape at the API boundary, reject unknown fields, enforce type conversion explicitly, and return a clear `400 Bad Request` response.
+Recommended fix: validate the JSON object at the API boundary, coerce types explicitly, and reject invalid values with a `400` response.
 
-### 2. Duplicate SKU Handling Is Missing
+### 2. Product Identity Is Mixed With Stock State
 
-Why it is a problem: SKU is a business identifier and should be unique within the correct inventory scope, but the original flow does not guard against duplicates.
+Why it is a problem: product data and warehouse inventory state are different concepts.
 
-Real production impact: Duplicate SKUs confuse fulfillment, reporting, and warehouse picking. The same item may appear twice in dashboards with conflicting quantities.
+Production impact: if the same handler creates product rows and stock rows together, it becomes hard to reason about ownership, deduplication, and auditing.
 
-Example failure scenario: Two import jobs create the same SKU in quick succession and the system now reports inflated inventory or routes orders to the wrong item.
+Example failure: an API request intended to add 20 units to Warehouse A accidentally creates a brand-new product row instead of updating the existing inventory balance.
 
-Recommended fix: Enforce a unique constraint in the database and pre-check conflicts in the service layer so the API can return a deterministic conflict response.
+Recommended fix: keep product creation separate and have the stock endpoint only create or update an `InventoryBalance` row.
 
-### 3. Missing Transaction Safety
+### 3. Warehouse Validation Is Missing
 
-Why it is a problem: The write path is not wrapped in a clear transactional boundary.
+Why it is a problem: the write should fail fast if the warehouse does not exist, is inactive, or belongs to another company.
 
-Real production impact: If one step succeeds and a later step fails, the system can leave the database in a half-written state that is hard to repair.
+Production impact: inventory can be attached to the wrong tenant or a warehouse that should no longer receive stock.
 
-Example failure scenario: Product creation succeeds, stock history insertion fails, and the API returns an error while the product row remains committed.
+Example failure: a request sends `warehouse_id=9999`, the row is accepted, and the platform later reports inventory for a location that should not exist.
 
-Recommended fix: Use a single transaction per request and commit only after all domain checks and related writes succeed.
+Recommended fix: load the warehouse inside the transaction and reject the request if the warehouse lookup fails.
 
-### 4. Partial Writes Cause Inconsistent State
+### 4. Transaction Boundaries Are Not Clear
 
-Why it is a problem: Mutations appear to happen before all validation and referential checks complete.
+Why it is a problem: inventory changes usually touch more than one row, especially when the system keeps an audit ledger.
 
-Real production impact: Operators may see products that exist without valid warehouse links, or quantities that were updated without the corresponding audit trail.
+Production impact: if the balance update succeeds but the transaction ledger insert fails, the stock count and the audit trail diverge.
 
-Example failure scenario: The endpoint updates the product quantity, then fails when writing the price history table, leaving stock changed but the audit trail missing.
+Example failure: stock is committed, the history insert raises an exception, and support has no reliable way to explain the mismatch.
 
-Recommended fix: Stage all changes inside the transaction and rollback everything on any failure.
+Recommended fix: wrap the balance write and the transaction ledger write in one database transaction.
 
-### 5. No Rollback Handling
+### 5. Rollback Handling Is Too Weak
 
-Why it is a problem: Exceptions are not consistently caught and rolled back.
+Why it is a problem: any failed database write should leave the session in a clean state.
 
-Real production impact: A failed write can poison the session and affect later requests, especially under a shared request worker.
+Production impact: a poisoned session can cause follow-up requests to fail even when their inputs are valid.
 
-Example failure scenario: A database integrity error is raised, the session is left dirty, and the next request fails immediately even though its payload is valid.
+Example failure: an `IntegrityError` is raised, the exception bubbles out, and the next request fails because the session was never rolled back.
 
-Recommended fix: Catch database exceptions, call `rollback()`, and return a controlled error response.
+Recommended fix: catch database exceptions, call `rollback()`, and return a controlled conflict or server error response.
 
-### 6. Bad Decimal Handling For Price
+### 6. Duplicate Protection Needs To Be Explicit
 
-Why it is a problem: Prices should never be handled as floating-point numbers because binary floats introduce rounding drift.
+Why it is a problem: the combination of warehouse and product should be unique in the inventory balance table.
 
-Real production impact: Even a one-cent mismatch across thousands of transactions creates reconciliation problems, billing disputes, and audit failures.
+Production impact: without a uniqueness rule, the same SKU can appear multiple times in the same warehouse with conflicting quantities.
 
-Example failure scenario: A price of `19.99` becomes `19.989999999` after multiple operations and billing exports no longer match the accounting system.
+Example failure: two concurrent imports insert the same warehouse-product row and the system later has to guess which quantity is correct.
 
-Recommended fix: Store money in `Decimal` with a fixed scale, validate precision, and serialize it as a string in API responses.
+Recommended fix: enforce a unique constraint on `(warehouse_id, product_id)` and map duplicate inserts to a clear conflict response.
 
-### 7. Warehouse Validation Is Missing
+### 7. Money Must Use Decimal, Not Float
 
-Why it is a problem: The endpoint does not verify that the referenced warehouse exists, is active, or is allowed to receive the product.
+Why it is a problem: floating-point arithmetic is not safe for currency.
 
-Real production impact: Inventory can be attached to a deleted or disabled warehouse, which breaks reporting and fulfillment workflows.
+Production impact: even tiny rounding errors create reconciliation noise in exports, invoices, and margin reporting.
 
-Example failure scenario: A product is created with `warehouse_id=9999` even though that warehouse was archived months ago.
+Example failure: repeated updates turn a price of `19.99` into a value that no longer matches accounting exports.
 
-Recommended fix: Resolve the warehouse inside the transaction and reject the write if the warehouse does not exist or is inactive.
+Recommended fix: use `Decimal`, normalize to the required scale, and serialize currency values as strings in API responses.
 
-### 8. Optional Field Handling Is Not Safe
-This endpoint is intended to create or update inventory state for a B2B SaaS inventory platform. In production, that means the handler must protect stock integrity, enforce warehouse-level correctness, and fail safely when data is invalid or the database rejects a write.
-Why it is a problem: Optional fields are treated inconsistently, which can accidentally overwrite valid existing values with `None` or empty strings.
+### 8. Optional Field Handling Should Be Intentional
 
-Real production impact: Operators can lose descriptions, reorder thresholds, or warehouse references during partial updates.
+Why it is a problem: patch-style updates should not overwrite existing data with `null` unless the client explicitly requested that change.
 
-Example failure scenario: A patch request omits `price`, but the handler sets the column to `NULL` instead of leaving the prior value unchanged.
+Production impact: valid data can disappear during partial updates if missing fields are treated the same as empty fields.
 
-Recommended fix: Distinguish between missing fields and explicit `null` values, and only update fields that were intentionally provided.
+Example failure: a request updates quantity only, but the handler also clears the product description because the field was omitted.
 
-### 9. No Authentication Or Authorization Consideration
+Recommended fix: distinguish between missing keys and explicit `null` values before updating the row.
 
-Example failure scenario: Inventory balance update succeeds, stock history insertion fails, and the API returns an error while the balance row remains committed.
-Why it is a problem: Inventory writes are privileged business operations and should not be open to every client.
+### 9. Authentication And Authorization Are Not Considered
 
-Real production impact: Unauthorized users can alter stock, causing fulfillment errors, fraud exposure, and loss of trust with merchants.
-Example failure scenario: The endpoint updates the warehouse inventory balance, then fails when writing the transaction ledger, leaving stock changed but the audit trail missing.
+Why it is a problem: stock writes are privileged operations.
 
-Example failure scenario: A low-privilege user changes product price or quantity and no access control stops the request.
+Production impact: unauthorized users could change warehouse balances, price records, or reorder thresholds.
 
-Example failure scenario: A patch request omits `threshold`, but the handler sets the column to `NULL` instead of leaving the prior value unchanged.
-Recommended fix: Require authenticated requests, enforce role-based permissions, and audit all write operations.
+Example failure: a low-privilege user hits the endpoint directly and changes stock data that should only be editable by operations staff.
 
-### 10. Products Existing In Multiple Warehouses Is Not Modeled Correctly
-Example failure scenario: An inventory record is created with `warehouse_id=9999` even though that warehouse was archived months ago.
+Recommended fix: require authentication, enforce role-based permissions, and include actor information in the audit trail.
 
-Why it is a problem: A single product may exist in multiple warehouses, but a naive single-row model often collapses all stock into one record.
+### 10. Concurrency Needs To Be Addressed
 
-Example failure scenario: One warehouse is out of stock while another has availability, but the system exposes a single combined quantity and ships from the wrong location.
-Real production impact: Location-specific stock levels become impossible to trust, which breaks transfer logic and warehouse allocation.
+Why it is a problem: two requests can read the same balance and overwrite each other if the write path is not protected.
 
-Example failure scenario: One warehouse is out of stock while another has availability, but the system exposes a single combined quantity and ships from the wrong location.
+Production impact: lost updates lead to inaccurate stock counts and bad replenishment decisions.
 
-Recommended fix: Model product identity separately from warehouse inventory, and enforce uniqueness on the product-and-warehouse pair instead of the product alone.
+Example failure: two restock jobs each add 10 units to the same balance, but only one update survives.
 
-### 11. Race Conditions And Concurrency Concerns
+Recommended fix: use row-level locking or optimistic concurrency control, depending on the database and throughput requirements.
 
-Why it is a problem: Two requests can read the same stock value, compute the same new value, and overwrite each other.
+## Corrected Production-Quality Shape
 
-Real production impact: Lost updates create undercounted or overcounted inventory, which is a direct revenue and fulfillment risk.
-from models import InventoryBalance, Product, Warehouse
-Example failure scenario: Two restock jobs each add 10 units based on the same starting quantity, but the final value reflects only one update.
+The example below shows the direction I would expect in production. The route validates the payload, resolves the warehouse and product, and writes the current balance and audit record in a single transaction.
 
-Recommended fix: Use transaction boundaries, row-level locking where supported, optimistic concurrency control, and database constraints that prevent invalid concurrent states.
+```python
+from decimal import Decimal, ROUND_HALF_UP
 
-def create_inventory_balance():
-
-Why it is a problem: The endpoint should return stable, machine-readable responses with clear status codes and error details.
-
-Real production impact: Client teams cannot reliably distinguish validation errors from conflicts or internal failures, which slows integration and support triage.
-
-Example failure scenario: The API returns a generic `500` with a raw exception string instead of a structured `409` conflict payload.
-
-Recommended fix: Standardize success and error envelopes, map domain failures to explicit HTTP codes, and return response metadata for clients.
-
-### 13. Lack Of Logging And Monitoring
-
-Why it is a problem: Without structured logs and metrics, failures in the write path are difficult to detect and diagnose.
-
-Real production impact: Inventory drift can persist for hours before anyone notices, and support engineers will have no reliable trail to trace the bad request.
-
-Example failure scenario: Repeated validation failures spike after a client release, but there is no request correlation ID or structured log entry to isolate the source.
-
-Recommended fix: Add structured request logging, error metrics, slow-query monitoring, and alerting on elevated conflict or rollback rates.
-
-### 14. Scalability Concerns
-
-Why it is a problem: The endpoint design couples request handling, validation, and persistence too tightly for a high-volume SaaS system.
-
-Real production impact: As volume grows, the API becomes hard to cache, hard to shard, and hard to extend with async workflows or background reconciliation.
-
-Example failure scenario: A bulk product import saturates the request workers because every write performs synchronous downstream side effects inline.
-
-Recommended fix: Keep the HTTP layer thin, move business logic into services, isolate write-heavy workflows, and prepare for event-driven processing.
-
-## Corrected Production-Quality Implementation
-
-The implementation below shows the shape I would expect in production: explicit validation, warehouse lookup, duplicate protection, `Decimal` for money, and a single transactional boundary per request.
-			existing_balance = (
-				db.session.query(InventoryBalance)
-				.filter(InventoryBalance.product.has(sku=sku), InventoryBalance.warehouse_id == warehouse_id)
-				.one_or_none()
-			)
-			if existing_balance is not None:
-				return _error("inventory balance for this sku already exists in the warehouse", 409, "duplicate_sku")
+from flask import Blueprint, jsonify, request
 from sqlalchemy.exc import IntegrityError
 
-from app import db
-from models import Product, Warehouse
-				price=price,
-				description=payload.get("description"),
+from stockflow.extensions import db
+from stockflow.models import InventoryBalance, InventoryTransaction, Product, Warehouse
+
+inventory_bp = Blueprint("inventory", __name__)
+
+
 def _error(message: str, status_code: int, code: str):
-	# Keep error responses uniform so clients and support tools can rely on them.
-	return jsonify({"success": False, "error": {"code": code, "message": message}}), status_code
+    return jsonify({"success": False, "error": {"code": code, "message": message}}), status_code
 
 
-def _success(data, status_code: int = 200):
-			balance = InventoryBalance(
-				company_id=warehouse.company_id,
-				warehouse_id=warehouse_id,
-				product=product,
-				quantity_on_hand=quantity,
-				reserved_quantity=0,
-				low_stock_threshold=payload.get("low_stock_threshold", 0),
-			)
-	# A stable envelope makes client integrations easier to test and safer to evolve.
-			db.session.add(product)
-			db.session.add(balance)
+def _parse_money(raw_value) -> Decimal:
+    value = Decimal(str(raw_value))
+    if value < 0:
+        raise ValueError("price must be greater than or equal to 0")
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
-			{
-				"product_id": product.id,
-				"sku": product.sku,
-				"name": product.name,
-				"warehouse_id": balance.warehouse_id,
-				"quantity_on_hand": balance.quantity_on_hand,
-				"price": str(product.price),
-	if value < Decimal("0"):
-		raise ValueError("price must be greater than or equal to 0")
+@inventory_bp.post("/companies/<int:company_id>/inventory-balances")
+def upsert_inventory_balance(company_id: int):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return _error("request body must be a JSON object", 400, "validation_error")
 
-	# Normalize to two decimal places for currency storage.
-	return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    try:
+        warehouse_id = int(payload["warehouse_id"])
+        product_id = int(payload["product_id"])
+        quantity_on_hand = int(payload["quantity_on_hand"])
+        unit_price = _parse_money(payload.get("unit_price", 0))
+    except (KeyError, TypeError, ValueError) as exc:
+        return _error(str(exc), 400, "validation_error")
 
+    if quantity_on_hand < 0:
+        return _error("quantity_on_hand must be zero or greater", 400, "validation_error")
 
-def _require_json_object():
-	payload = request.get_json(silent=True)
-	if not isinstance(payload, dict):
-		raise ValueError("request body must be a JSON object")
-	return payload
+    try:
+        with db.session.begin():
+            warehouse = (
+                db.session.query(Warehouse)
+                .filter(Warehouse.id == warehouse_id, Warehouse.company_id == company_id)
+                .one_or_none()
+            )
+            if warehouse is None or not warehouse.is_active:
+                return _error("warehouse not found", 404, "warehouse_not_found")
 
+            product = (
+                db.session.query(Product)
+                .filter(Product.id == product_id, Product.company_id == company_id)
+                .one_or_none()
+            )
+            if product is None or not product.is_active:
+                return _error("product not found", 404, "product_not_found")
 
-@products_bp.post("/products")
-def create_product():
-	payload = _require_json_object()
+            balance = (
+                db.session.query(InventoryBalance)
+                .filter(
+                    InventoryBalance.company_id == company_id,
+                    InventoryBalance.warehouse_id == warehouse_id,
+                    InventoryBalance.product_id == product_id,
+                )
+                .one_or_none()
+            )
 
-	required_fields = {"sku", "name", "warehouse_id", "price", "quantity"}
-	missing = sorted(field for field in required_fields if field not in payload)
-	if missing:
-		return _error(f"missing required fields: {', '.join(missing)}", 400, "validation_error")
+            if balance is None:
+                balance = InventoryBalance(
+                    company_id=company_id,
+                    warehouse_id=warehouse_id,
+                    product_id=product_id,
+                    quantity_on_hand=quantity_on_hand,
+                    reserved_quantity=0,
+                    low_stock_threshold=0,
+                )
+                db.session.add(balance)
+            else:
+                balance.quantity_on_hand = quantity_on_hand
 
-	sku = str(payload["sku"]).strip()
-	name = str(payload["name"]).strip()
+            db.session.add(
+                InventoryTransaction(
+                    company_id=company_id,
+                    warehouse_id=warehouse_id,
+                    product_id=product_id,
+                    transaction_type="adjustment",
+                    quantity_delta=quantity_on_hand,
+                    notes="manual inventory correction",
+                )
+            )
 
-	if not sku:
-		return _error("sku cannot be empty", 400, "validation_error")
-	if not name:
-		return _error("name cannot be empty", 400, "validation_error")
+    except IntegrityError:
+        db.session.rollback()
+        return _error("inventory balance already exists for this warehouse and product", 409, "duplicate_inventory_balance")
 
-	try:
-		warehouse_id = int(payload["warehouse_id"])
-		quantity = int(payload.get("quantity", 0))
-		price = _parse_price(payload["price"])
-	except (TypeError, ValueError) as exc:
-		return _error(str(exc), 400, "validation_error")
-
-	if quantity < 0:
-		return _error("quantity cannot be negative", 400, "validation_error")
-
-	# All persistence work happens inside one transaction so a failure cannot leave partial state behind.
-	try:
-		with db.session.begin():
-			warehouse = db.session.get(Warehouse, warehouse_id)
-			if warehouse is None or not warehouse.is_active:
-				return _error("warehouse not found or inactive", 404, "warehouse_not_found")
-
-			existing_product = (
-				db.session.query(Product)
-				.filter(Product.sku == sku, Product.warehouse_id == warehouse_id)
-				.one_or_none()
-			)
-			if existing_product is not None:
-				return _error("product with this sku already exists in the warehouse", 409, "duplicate_sku")
-
-			product = Product(
-				sku=sku,
-				name=name,
-				warehouse_id=warehouse_id,
-				quantity=quantity,
-				price=price,
-				description=payload.get("description"),
-			)
-
-			# Optional fields are applied only when intentionally provided.
-			if "description" in payload and payload["description"] is not None:
-				product.description = str(payload["description"]).strip() or None
-
-			db.session.add(product)
-
-		return _success(
-			{
-				"id": product.id,
-				"sku": product.sku,
-				"name": product.name,
-				"warehouse_id": product.warehouse_id,
-				"quantity": product.quantity,
-				"price": str(product.price),
-			},
-			201,
-		)
-
-	except IntegrityError:
-		# Database constraints are the final safety net, and every integrity failure must rollback cleanly.
-		db.session.rollback()
-		return _error("write conflict detected", 409, "conflict")
-	except Exception:
-		db.session.rollback()
-		# In production this branch should also emit a structured error log with request context.
-		return _error("unexpected server error", 500, "internal_server_error")
+    response_payload = {
+        "company_id": company_id,
+        "warehouse_id": warehouse_id,
+        "product_id": product_id,
+        "quantity_on_hand": quantity_on_hand,
+        "unit_price": str(unit_price),
+    }
+    return jsonify({"success": True, "data": response_payload}), 201
 ```
-
-## Why This Version Is Safer
-
-- It validates request data before persistence.
-- It treats price as `Decimal`, not float.
-- It validates warehouse existence before write.
-- It uses one transaction for the entire operation.
-- It explicitly handles duplicates and rollback paths.
-- It keeps API responses stable and machine-readable.
-- It leaves room for authorization and observability hooks.
 
 ## Additional Production Improvements
 
-Beyond the endpoint fix, I would recommend the following production hardening steps:
-
-- Async event processing for downstream updates such as notifications, stock movements, and analytics.
-- Audit logs for every create, update, and delete action, including actor identity and before/after values.
-- Retry handling for transient database or integration failures, with idempotency safeguards.
-- Observability through structured logs, metrics, traces, and request correlation IDs.
-- Rate limiting to protect write endpoints from abuse and accidental traffic spikes.
-- Idempotency keys for create and import flows to prevent duplicate writes during client retries.
-- Soft deletes so historical inventory records remain recoverable and auditable.
+- Return validation errors in a single structured format across all inventory endpoints.
+- Add request IDs and actor IDs to logs so inventory changes can be traced quickly.
+- Include an immutable audit ledger for every change that affects on-hand quantity.
+- Add tests for duplicate warehouse-product writes, invalid warehouse IDs, and rollback behavior.
+- Keep product creation separate from inventory updates so the data model remains easy to reason about.
 
 ## Closing Assessment
 
-The main defect is not just a single bug; it is a design gap. The endpoint needs to behave like a transactional business operation, not a simple CRUD handler. Once validation, transaction boundaries, and database constraints are aligned, the API becomes much more reliable under real warehouse traffic and much easier to support in production.
+The key lesson is that inventory correctness depends on discipline at the boundary. The endpoint should not guess, merge, or partially commit its way through bad input. It should validate early, write atomically, and keep product identity separate from warehouse stock state.
